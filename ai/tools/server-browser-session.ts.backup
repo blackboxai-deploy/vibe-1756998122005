@@ -1,0 +1,730 @@
+import * as fs from "fs/promises"
+import * as path from "path"
+import { Browser, Page, chromium } from "playwright"
+
+export interface BrowserActionResult {
+  execution_success?: boolean
+  screenshot?: string
+  logs?: string
+  console_logs?: string
+  execution_logs?: string
+  currentUrl?: string
+  currentMousePosition?: string
+}
+
+export class ServerBrowserSession {
+  private browser?: Browser
+  private page?: Page
+  private currentMousePosition?: string
+  private static instance?: ServerBrowserSession
+
+  private constructor() {}
+
+  static getInstance(): ServerBrowserSession {
+    if (!ServerBrowserSession.instance) {
+      ServerBrowserSession.instance = new ServerBrowserSession()
+    }
+    return ServerBrowserSession.instance
+  }
+
+  async launchBrowser(): Promise<BrowserActionResult> {
+    console.log("Launching browser...")
+    if (this.browser) {
+      await this.closeBrowser()
+    }
+
+    try {
+      this.browser = await chromium.launch({
+        args: [
+          "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-web-security",
+          "--disable-extensions"
+        ],
+        headless: true,
+      })
+      
+      const context = await this.browser.newContext({
+        viewport: { width: 900, height: 600 }
+      })
+      this.page = await context.newPage()
+      
+      console.log("Launched Browser!!")
+      return {
+        execution_success: true,
+        logs: "Browser session started successfully",
+        execution_logs: "Browser launched and ready for interaction"
+      }
+    } catch (error) {
+      const errorMessage = `Failed to launch browser: ${error instanceof Error ? error.message : String(error)}`
+      console.error(`[Error] Exception during Starting browser - ${errorMessage}`)
+      return {
+        execution_success: false,
+        logs: errorMessage,
+        execution_logs: errorMessage
+      }
+    }
+  }
+
+  async closeBrowser(): Promise<BrowserActionResult> {
+    if (this.browser || this.page) {
+      console.log("Closing browser...")
+      try {
+        await this.browser?.close()
+        this.browser = undefined
+        this.page = undefined
+        this.currentMousePosition = undefined
+        return {
+          execution_success: true,
+          logs: "Browser session closed successfully",
+          execution_logs: "Browser closed successfully"
+        }
+      } catch (error) {
+        const errorMessage = `Error closing browser: ${error instanceof Error ? error.message : String(error)}`
+        console.warn(errorMessage)
+        return {
+          execution_success: false,
+          logs: errorMessage,
+          execution_logs: errorMessage
+        }
+      }
+    }
+    return {
+      execution_success: true,
+      logs: "Browser was already closed",
+      execution_logs: "No browser to close"
+    }
+  }
+
+  private async waitForReactUpdates(timeout: number = 3000): Promise<void> {
+    if (!this.page) return
+
+    const startTime = Date.now()
+    
+    try {
+      // Wait for React components to finish updating by checking for common patterns
+      await this.page.waitForFunction(() => {
+        // Check if there are any pending React updates or transitions
+        const hasPendingUpdates = () => {
+          // Look for React 18 concurrent features
+          if (window.React && (window.React as any).version >= '18') {
+            // Check for transition states
+            const hasActiveTransitions = document.querySelector('[data-react-transition]')
+            if (hasActiveTransitions) return true
+          }
+          
+          // Check for loading states and spinners
+          const loadingSelectors = [
+            '[data-loading="true"]',
+            '.loading',
+            '.spinner',
+            '[aria-busy="true"]',
+            '.skeleton',
+            '[data-testid*="loading"]',
+            '[class*="loading"]'
+          ]
+          
+          const hasLoadingElements = loadingSelectors.some(selector => 
+            document.querySelector(selector) !== null
+          )
+          
+          if (hasLoadingElements) return true
+          
+          // Check for form submission states
+          const submittingElements = document.querySelectorAll('[data-submitting="true"], [disabled][type="submit"]')
+          if (submittingElements.length > 0) return true
+          
+          return false
+        }
+        
+        // Return true when no pending updates are detected
+        return !hasPendingUpdates()
+      }, { timeout })
+      
+    } catch (error) {
+      // Timeout is acceptable - continue with screenshot
+      console.log(`React update detection timeout after ${Date.now() - startTime}ms`)
+    }
+  }
+
+  private async waitTillHTMLStable(timeout: number = 5000): Promise<void> {
+    if (!this.page) return
+
+    const checkDurationMs = 500
+    const maxChecks = timeout / checkDurationMs
+    let lastHTMLSize = 0
+    let checkCounts = 1
+    let countStableSizeIterations = 0
+    const minStableSizeIterations = 3
+
+    while (checkCounts <= maxChecks) {
+      try {
+        const html = await this.page.content()
+        const currentHTMLSize = html.length
+        
+        console.log(`last: ${lastHTMLSize} <> curr: ${currentHTMLSize}`)
+        
+        if (lastHTMLSize !== 0 && currentHTMLSize === lastHTMLSize) {
+          countStableSizeIterations++
+        } else {
+          countStableSizeIterations = 0
+        }
+
+        if (countStableSizeIterations >= minStableSizeIterations) {
+          console.log("Page rendered fully...")
+          break
+        }
+
+        lastHTMLSize = currentHTMLSize
+        await new Promise(resolve => setTimeout(resolve, checkDurationMs))
+        checkCounts++
+      } catch (error) {
+        console.warn("Error checking HTML stability:", error)
+        break
+      }
+    }
+  }
+
+  private async doAction(action: () => Promise<string>): Promise<BrowserActionResult> {
+    let executionSuccess = true
+    let screenshot: string | undefined
+    
+    if (!this.page) {
+      executionSuccess = false
+      throw new Error("Browser is not launched. This may occur if the browser was automatically closed.")
+    }
+
+    const logs: string[] = []
+    let executionLog = ""
+    let lastLogTs = Date.now()
+
+    const consoleListener = (msg: any) => {
+      try {
+        if (msg.type() === "log") {
+          logs.push(msg.text())
+        } else {
+          logs.push(`[${msg.type()}] ${msg.text()}`)
+        }
+        lastLogTs = Date.now()
+      } catch (error) {
+        logs.push(`[Console Error] ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    this.page.on("console", consoleListener)
+
+    try {
+      const result = await action()
+      executionLog += `\n ${result}`
+    } catch (err) {
+      executionLog += `\n [Error] ${err instanceof Error ? err.message : String(err)}`
+      executionSuccess = false
+    }
+
+    // Enhanced waiting for page updates and network activity
+    try {
+      // Wait for any network requests to complete (API calls, etc.)
+      await this.page.waitForLoadState('networkidle', { timeout: 3000 })
+      executionLog += "\n [Info] Waited for network activity to complete"
+    } catch (error) {
+      executionLog += "\n [Info] Network activity timeout (expected for non-navigation actions)"
+    }
+
+    // Multiple stability checks for better React state detection
+    let stabilityAttempts = 0
+    const maxStabilityAttempts = 3
+    
+    while (stabilityAttempts < maxStabilityAttempts) {
+      try {
+        // Wait for DOM stability (important for dynamic content updates)
+        await this.waitTillHTMLStable(2000)
+        executionLog += "\n [Info] DOM content stabilized"
+        
+        // Wait for React-specific updates (forms, loading states, etc.)
+        await this.waitForReactUpdates(2000)
+        executionLog += "\n [Info] React component updates completed"
+        
+        // Additional wait for any remaining re-renders
+        await this.page.waitForTimeout(500)
+        
+        // Final check for any remaining loading indicators
+        const hasLoadingIndicators = await this.page.evaluate(() => {
+          // Check for common loading states
+          const loadingSelectors = [
+            '[data-loading="true"]',
+            '.loading',
+            '.spinner',
+            '[aria-busy="true"]',
+            '.skeleton'
+          ]
+          
+          return loadingSelectors.some(selector => 
+            document.querySelector(selector) !== null
+          )
+        })
+        
+        if (!hasLoadingIndicators) {
+          executionLog += "\n [Info] No loading indicators detected, page appears ready"
+          break
+        } else {
+          executionLog += "\n [Info] Loading indicators detected, waiting longer..."
+          await this.page.waitForTimeout(1000)
+        }
+      } catch (error) {
+        executionLog += "\n [Warn] Stability check timeout, continuing..."
+        break
+      }
+      
+      stabilityAttempts++
+    }
+
+    // Wait for console inactivity
+    try {
+      await this.waitForConsoleInactivity(lastLogTs, 2000)
+    } catch (error) {
+      // Timeout is expected
+    }
+
+    // Final wait for any remaining React updates and animations
+    await this.page.waitForTimeout(1200)
+
+    // Take screenshot with better error handling and retry logic
+    let screenshotAttempts = 0
+    const maxAttempts = 3
+    
+    try {
+      while (screenshotAttempts < maxAttempts) {
+        try {
+          // Wait for any remaining animations or transitions to complete
+          await this.page.waitForTimeout(500)
+          
+          // Ensure page is fully rendered by checking for stable viewport
+          await this.page.evaluate(() => {
+            return new Promise<void>((resolve) => {
+              if (document.readyState === 'complete') {
+                // Additional check for React components that might still be updating
+                setTimeout(resolve, 200)
+              } else {
+                document.addEventListener('readystatechange', () => {
+                  if (document.readyState === 'complete') {
+                    setTimeout(resolve, 200)
+                  }
+                })
+              }
+            })
+          })
+          
+          // Take screenshot with full page capture
+          const screenshotBytes = await this.page.screenshot({ 
+            type: 'png',
+            fullPage: false, // Keep viewport consistent
+            clip: { x: 0, y: 0, width: 900, height: 600 }, // Ensure consistent dimensions
+            animations: 'disabled' // Disable animations for consistent screenshots
+          })
+          const screenshotBase64 = screenshotBytes.toString('base64')
+          screenshot = `data:image/png;base64,${screenshotBase64}`
+          
+          // Validate screenshot was generated properly
+          if (screenshotBase64.length > 100) {
+            executionLog += "\n [Info] Screenshot captured successfully"
+            
+            // Additional validation: check if screenshot contains actual content
+            const imageSize = Math.round(screenshotBytes.length / 1024)
+            executionLog += `\n [Info] Screenshot size: ${imageSize}KB`
+            
+            if (imageSize > 5) { // Reasonable minimum size for a 900x600 screenshot
+              break // Success
+            } else {
+              throw new Error(`Screenshot too small (${imageSize}KB), likely blank or corrupted`)
+            }
+          } else {
+            throw new Error('Screenshot data too small, likely corrupted')
+          }
+        } catch (attemptError) {
+          screenshotAttempts++
+          executionLog += `\n [Warn] Screenshot attempt ${screenshotAttempts} failed: ${attemptError instanceof Error ? attemptError.message : String(attemptError)}`
+          
+          if (screenshotAttempts >= maxAttempts) {
+            throw attemptError
+          }
+          // Wait before retry and force page repaint
+          await this.page.evaluate(() => {
+            // Force a repaint by triggering a reflow
+            document.body.style.display = 'none'
+            document.body.offsetHeight // Trigger reflow
+            document.body.style.display = ''
+          })
+          await this.page.waitForTimeout(800)
+        }
+      }
+    } catch (error) {
+      executionLog += `\n [Error] Error taking screenshot of the current state of page! Attempts: ${screenshotAttempts}/${maxAttempts}. ${error instanceof Error ? error.message : String(error)}`
+      // Don't fail the entire action just because screenshot failed
+      screenshot = undefined
+    }
+
+    try {
+      this.page.off("console", consoleListener)
+    } catch (error) {
+      console.log(`Error removing console listener: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    
+    if (executionSuccess) {
+      executionLog += "\n Action executed Successfully!"
+    }
+
+    return {
+      execution_success: executionSuccess,
+      screenshot,
+      console_logs: logs.join("\n"),
+      execution_logs: executionLog,
+      currentUrl: this.page.url(),
+      currentMousePosition: this.currentMousePosition,
+      // Also provide the old format for backward compatibility
+      logs: logs.join("\n")
+    }
+  }
+
+  private async waitForConsoleInactivity(lastLogTs: number, timeout = 3000): Promise<void> {
+    const startTime = Date.now()
+    while (Date.now() - lastLogTs < 500 && Date.now() - startTime < timeout) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
+
+  async navigateToUrl(url: string): Promise<BrowserActionResult> {
+    if (!this.page || !this.browser) {
+      const launchResult = await this.launchBrowser()
+      if (!launchResult.execution_success) {
+        return launchResult
+      }
+    }
+    
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      let executionLog = ""
+      
+      const response = await this.page.goto(url, {
+        timeout: 30000,
+        waitUntil: "networkidle"
+      })
+
+      if (!response) {
+        executionLog += `
+ Navigation failed or no response received for URL: ${url}`
+        throw new Error(`Navigation failed or no response received for URL: ${url}`)
+      } else {
+        executionLog += `
+ Navigated to URL: ${url}`
+      }
+      
+      await this.waitTillHTMLStable()
+      return executionLog
+    })
+  }
+
+  async click(coordinate: string): Promise<BrowserActionResult> {
+    const [x, y] = coordinate.split(",").map(Number)
+    
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      let hasNetworkActivity = false
+      let executionLog = ""
+      
+      const requestListener = () => {
+        hasNetworkActivity = true
+      }
+      
+      this.page.on("request", requestListener)
+      await this.page.mouse.click(x, y)
+      this.currentMousePosition = coordinate
+      executionLog += "\nClick Action Performed!"
+      
+      await new Promise(resolve => setTimeout(resolve, 100))
+      
+      if (hasNetworkActivity) {
+        try {
+          await this.page.waitForLoadState("networkidle", { timeout: 7000 })
+          await this.waitTillHTMLStable()
+        } catch (error) {
+          // Navigation timeout is common and not necessarily an error
+          console.log("Navigation wait timeout (expected for non-navigating clicks)")
+        }
+      }
+      
+      this.page.off("request", requestListener)
+      return executionLog
+    })
+  }
+
+  async type(text: string): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      await this.page.keyboard.type(text)
+      return "Type action performed!"
+    })
+  }
+
+  async scrollDown(): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      await this.page.evaluate("window.scrollBy({top: 600, behavior: 'auto'})")
+      await new Promise(resolve => setTimeout(resolve, 300))
+      return "Scroll down action performed!"
+    })
+  }
+
+  async scrollUp(): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      await this.page.evaluate("window.scrollBy({top: -600, behavior: 'auto'})")
+      await new Promise(resolve => setTimeout(resolve, 300))
+      return "Scroll up action performed!"
+    })
+  }
+
+  async clickElement(selector: string): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      let hasNetworkActivity = false
+      let executionLog = ""
+      
+      const requestListener = () => {
+        hasNetworkActivity = true
+      }
+      
+      this.page.on("request", requestListener)
+      
+      // Wait for element to be visible and clickable
+      await this.page.waitForSelector(selector, { state: 'visible', timeout: 10000 })
+      
+      // Get element coordinates for better click positioning
+      const element = await this.page.locator(selector).first()
+      const boundingBox = await element.boundingBox()
+      
+      if (boundingBox) {
+        const x = boundingBox.x + boundingBox.width / 2
+        const y = boundingBox.y + boundingBox.height / 2
+        await this.page.mouse.click(x, y)
+        this.currentMousePosition = `${Math.round(x)},${Math.round(y)}`
+        executionLog += `\nClicked element '${selector}' at coordinates (${Math.round(x)}, ${Math.round(y)})`
+      } else {
+        // Fallback to direct click
+        await element.click()
+        executionLog += `\nClicked element '${selector}' (center positioning)`
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 100))
+      
+      if (hasNetworkActivity) {
+        try {
+          await this.page.waitForLoadState("networkidle", { timeout: 7000 })
+          await this.waitTillHTMLStable()
+        } catch (error) {
+          // Navigation timeout is common and not necessarily an error
+          console.log("Navigation wait timeout (expected for non-navigating clicks)")
+        }
+      }
+      
+      this.page.off("request", requestListener)
+      return executionLog
+    })
+  }
+
+  async waitForElement(selector: string, timeout: number = 10000): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      await this.page.waitForSelector(selector, { state: 'visible', timeout })
+      return `Element '${selector}' is now visible and ready for interaction`
+    })
+  }
+
+  async getElementInfo(selector: string): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      const element = this.page.locator(selector).first()
+      const isVisible = await element.isVisible().catch(() => false)
+      const isEnabled = await element.isEnabled().catch(() => false)
+      const text = await element.textContent().catch(() => '')
+      const boundingBox = await element.boundingBox().catch(() => null)
+      
+      let info = `Element '${selector}' information:\n`
+      info += `- Visible: ${isVisible}\n`
+      info += `- Enabled: ${isEnabled}\n`
+      info += `- Text: "${text}"\n`
+      
+      if (boundingBox) {
+        const centerX = Math.round(boundingBox.x + boundingBox.width / 2)
+        const centerY = Math.round(boundingBox.y + boundingBox.height / 2)
+        info += `- Position: x=${Math.round(boundingBox.x)}, y=${Math.round(boundingBox.y)}\n`
+        info += `- Size: width=${Math.round(boundingBox.width)}, height=${Math.round(boundingBox.height)}\n`
+        info += `- Center coordinates: (${centerX}, ${centerY})\n`
+      } else {
+        info += `- Element not found or not visible\n`
+      }
+      
+      return info
+    })
+  }
+
+  async getPageState(): Promise<BrowserActionResult> {
+    return this.doAction(async () => {
+      if (!this.page) throw new Error("Page not available")
+      
+      // Get comprehensive page state information
+      const pageState = await this.page.evaluate(() => {
+        const state = {
+          title: document.title,
+          url: window.location.href,
+          readyState: document.readyState,
+          forms: [] as any[],
+          inputs: [] as any[],
+          buttons: [] as any[],
+          loadingElements: [] as string[],
+          errors: [] as string[],
+        }
+        
+        // Get form information
+        document.querySelectorAll('form').forEach((form, index) => {
+          state.forms.push({
+            index,
+            action: form.action || 'current page',
+            method: form.method || 'GET',
+            elements: form.elements.length
+          })
+        })
+        
+        // Get input information
+        document.querySelectorAll('input, textarea, select').forEach((input, index) => {
+          const element = input as HTMLInputElement
+          state.inputs.push({
+            index,
+            type: element.type || 'text',
+            name: element.name || '',
+            id: element.id || '',
+            value: element.value || '',
+            placeholder: element.placeholder || '',
+            disabled: element.disabled,
+            required: element.required
+          })
+        })
+        
+        // Get button information
+        document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach((btn, index) => {
+          const button = btn as HTMLButtonElement
+          state.buttons.push({
+            index,
+            text: button.textContent?.trim() || button.value || '',
+            disabled: button.disabled,
+            type: button.type || 'button'
+          })
+        })
+        
+        // Check for loading elements
+        const loadingSelectors = [
+          '[data-loading="true"]',
+          '.loading',
+          '.spinner',
+          '[aria-busy="true"]',
+          '.skeleton',
+          '[data-testid*="loading"]'
+        ]
+        
+        loadingSelectors.forEach(selector => {
+          const elements = document.querySelectorAll(selector)
+          if (elements.length > 0) {
+            state.loadingElements.push(`${elements.length} elements with ${selector}`)
+          }
+        })
+        
+        // Check for error messages
+        const errorSelectors = [
+          '.error',
+          '[role="alert"]',
+          '.alert-danger',
+          '[data-testid*="error"]',
+          '[aria-invalid="true"]'
+        ]
+        
+        errorSelectors.forEach(selector => {
+          document.querySelectorAll(selector).forEach(el => {
+            const text = el.textContent?.trim()
+            if (text) {
+              state.errors.push(text)
+            }
+          })
+        })
+        
+        return state
+      })
+      
+      let stateReport = `Current Page State:\n`
+      stateReport += `- Title: ${pageState.title}\n`
+      stateReport += `- URL: ${pageState.url}\n`
+      stateReport += `- Ready State: ${pageState.readyState}\n\n`
+      
+      if (pageState.forms.length > 0) {
+        stateReport += `Forms (${pageState.forms.length}):\n`
+        pageState.forms.forEach(form => {
+          stateReport += `  - Form ${form.index}: ${form.method} to ${form.action} (${form.elements} elements)\n`
+        })
+        stateReport += '\n'
+      }
+      
+      if (pageState.inputs.length > 0) {
+        stateReport += `Input Fields (${pageState.inputs.length}):\n`
+        pageState.inputs.slice(0, 10).forEach(input => { // Limit to first 10
+          stateReport += `  - ${input.type}: "${input.name}" = "${input.value}" ${input.disabled ? '(disabled)' : ''}\n`
+        })
+        if (pageState.inputs.length > 10) {
+          stateReport += `  ... and ${pageState.inputs.length - 10} more\n`
+        }
+        stateReport += '\n'
+      }
+      
+      if (pageState.buttons.length > 0) {
+        stateReport += `Buttons (${pageState.buttons.length}):\n`
+        pageState.buttons.slice(0, 10).forEach(btn => { // Limit to first 10
+          stateReport += `  - "${btn.text}" (${btn.type}) ${btn.disabled ? '(disabled)' : ''}\n`
+        })
+        if (pageState.buttons.length > 10) {
+          stateReport += `  ... and ${pageState.buttons.length - 10} more\n`
+        }
+        stateReport += '\n'
+      }
+      
+      if (pageState.loadingElements.length > 0) {
+        stateReport += `Loading Elements:\n`
+        pageState.loadingElements.forEach(loading => {
+          stateReport += `  - ${loading}\n`
+        })
+        stateReport += '\n'
+      }
+      
+      if (pageState.errors.length > 0) {
+        stateReport += `Error Messages:\n`
+        pageState.errors.forEach(error => {
+          stateReport += `  - ${error}\n`
+        })
+        stateReport += '\n'
+      }
+      
+      if (pageState.loadingElements.length === 0 && pageState.errors.length === 0) {
+        stateReport += `✅ Page appears stable with no loading indicators or errors detected.\n`
+      }
+      
+      return stateReport
+    })
+  }
+}
