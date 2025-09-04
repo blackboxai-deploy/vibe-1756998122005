@@ -1,0 +1,65 @@
+/* Intersection Observer Safari Repaint CSS Support */
+
+/* Target Safari specifically */
+@supports (-webkit-touch-callout: none) {
+  
+  /* Minimal hardware acceleration for chat elements */
+  [data-chat-container],
+  [data-chat-list],
+  [data-chat-message] {
+    /* Enable will-change only for elements being observed */
+    will-change: auto;
+    /* Minimal containment for performance */
+    contain: layout;
+  }
+  
+  /* Streaming elements get slightly more optimization */
+  [data-streaming] {
+    will-change: transform;
+    contain: layout style;
+    /* Minimal transform to enable GPU without layer overflow */
+    transform: translateZ(0);
+  }
+  
+  /* Ensure main content areas are always visible */
+  [data-main-content],
+  #__next {
+    opacity: 1 !important;
+    visibility: visible !important;
+  }
+  
+  /* Optimize scrolling performance */
+  [data-chat-list] {
+    -webkit-overflow-scrolling: touch;
+    /* Contain scrolling for better performance */
+    overscroll-behavior: contain;
+  }
+  
+  /* Performance optimization during streaming */
+  body[data-safari-streaming] {
+    /* Reduce rendering complexity during streaming */
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeSpeed;
+  }
+  
+  body[data-safari-streaming] * {
+    /* Disable expensive effects during streaming */
+    animation-duration: 0.1s;
+    transition-duration: 0.1s;
+  }
+}
+
+/* Animation for gentle repaints */
+@keyframes safari-gentle-repaint {
+  0% { 
+    opacity: 0.999999; 
+  }
+  100% { 
+    opacity: 1; 
+  }
+}
+
+/* Class for elements being repainted */
+.safari-repaint-active {
+  animation: safari-gentle-repaint 0.1s ease-out;
+}
